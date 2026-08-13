@@ -18,6 +18,8 @@ if REPO_ROOT not in sys.path:
 
 from colorama import Fore, Style, init
 
+from common import load_proxies, load_webhook_url
+
 init(autoreset=True)
 
 RAINBOW_COLORS = (
@@ -127,6 +129,16 @@ def show_menu():
     print()
     print(f"{Style.BRIGHT}{rainbow_lines(BANNER)}{Style.RESET_ALL}")
     print(f"{rainbow('  Username Checker Suite - pick a tool')}")
+
+    proxy_count = len(load_proxies())
+    webhook_url = load_webhook_url()
+    webhook_state = "on" if webhook_url else "off"
+    webhook_color = Fore.GREEN if webhook_url else Fore.RED
+    print(
+        f"  {Fore.LIGHTWHITE_EX}proxies: {Style.BRIGHT}{proxy_count}{Style.RESET_ALL}"
+        f"  {Fore.LIGHTWHITE_EX}/  webhook: {webhook_color}{webhook_state}{Style.RESET_ALL}"
+    )
+
     print(f"{Fore.LIGHTBLACK_EX}{'-' * 58}{Style.RESET_ALL}")
     for i, (label, _, _) in enumerate(TOOLS):
         color = ITEM_COLORS[i % len(ITEM_COLORS)]
