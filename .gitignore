@@ -1,0 +1,20 @@
+# Secrets - never commit these
+proxy.txt
+webhook.txt
+discord/config.json
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime output / results files
+available.txt
+taken.txt
+invalid.txt
+valid.txt
+censored.txt
+
+# Scratch / input data
+list.txt
+test.txt
