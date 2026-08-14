@@ -18,15 +18,17 @@ if REPO_ROOT not in sys.path:
 
 from colorama import Fore, Style, init
 
-from common import load_proxies, load_webhook_url
+from common import load_proxies, load_webhook_url, probe_proxies
 
 init(autoreset=True)
 
 RAINBOW_COLORS = (
-    "\033[95m",  # light magenta
-    "\033[35m",  # magenta
-    "\033[97m",  # bright white
-    "\033[37m",  # white
+    "\033[91m",  # bright red
+    "\033[93m",  # bright yellow
+    "\033[92m",  # bright green
+    "\033[96m",  # bright cyan
+    "\033[94m",  # bright blue
+    "\033[95m",  # bright magenta
 )
 
 
@@ -40,12 +42,21 @@ def rainbow_lines(text):
     return "\n".join(rainbow(line) for line in text.split("\n"))
 
 BANNER = r"""
- _   _                                                     _ ____  ____
-| | | |___  ___ _ __ ___  __ _ _ __   ___   ___ _ __   ___(_) ___||  _ \
-| | | / __|/ _ \ '_ ` _ \/ _` | '_ \ / _ \ / __| '_ \ / _ \ |___ \| |_) |
-| |_| \__ \  __/ | | | | | (_| | | | |  __/| (__| | | |  __/ |___) |  __/
- \___/|___/\___|_| |_| |_|\__,_|_| |_|\___| \___|_| |_|\___|_|____/|_|
+                     ______
+                  .-"      "-.
+                 /            \
+                |              |
+                |,  .-.  .-.  ,|
+                | )(_o/  \o_)( |
+                |/     /\     \|
+                (_     ^^     _)
+                 \__|IIIIII|__/
+                  | \IIIIII/ |
+                  \          /
+                   `--------`
 """
+
+TITLE = "U S E R N A M E   S N I P E R"
 
 # (menu label, folder, script)
 TOOLS = [
@@ -58,10 +69,12 @@ TOOLS = [
 ]
 
 ITEM_COLORS = (
-    Fore.MAGENTA,
+    Fore.LIGHTCYAN_EX,
+    Fore.LIGHTGREEN_EX,
+    Fore.LIGHTYELLOW_EX,
+    Fore.LIGHTBLUE_EX,
     Fore.LIGHTMAGENTA_EX,
-    Fore.WHITE,
-    Fore.LIGHTWHITE_EX,
+    Fore.LIGHTRED_EX,
 )
 
 
@@ -125,26 +138,48 @@ def check_all_file():
     )
 
 
+_proxy_health_cache = None
+
+
+def get_proxy_health():
+    """Probe proxies once per session and cache the (live, dead) counts."""
+    global _proxy_health_cache
+    if _proxy_health_cache is not None:
+        return _proxy_health_cache
+    proxies = load_proxies()
+    if not proxies:
+        _proxy_health_cache = (0, 0)
+        return _proxy_health_cache
+    sys.stdout.write("  checking proxies...")
+    sys.stdout.flush()
+    live, dead = probe_proxies(proxies)
+    sys.stdout.write("\r" + " " * 40 + "\r")
+    sys.stdout.flush()
+    _proxy_health_cache = (live, dead)
+    return _proxy_health_cache
+
+
 def show_menu():
     print()
-    print(f"{Style.BRIGHT}{rainbow_lines(BANNER)}{Style.RESET_ALL}")
-    print(f"{rainbow('  Username Checker Suite - pick a tool')}")
+    print(rainbow_lines(BANNER))
+    print(f"{Style.BRIGHT}{rainbow(TITLE)}{Style.RESET_ALL}")
 
-    proxy_count = len(load_proxies())
+    live, dead = get_proxy_health()
     webhook_url = load_webhook_url()
     webhook_state = "on" if webhook_url else "off"
     webhook_color = Fore.GREEN if webhook_url else Fore.RED
     print(
-        f"  {Fore.LIGHTWHITE_EX}proxies: {Style.BRIGHT}{proxy_count}{Style.RESET_ALL}"
-        f"  {Fore.LIGHTWHITE_EX}/  webhook: {webhook_color}{webhook_state}{Style.RESET_ALL}"
+        f"  {Fore.LIGHTWHITE_EX}proxies: {Style.BRIGHT}{Fore.GREEN}{live} live{Style.RESET_ALL}"
+        f" {Fore.LIGHTWHITE_EX}/ {Fore.RED}{dead} dead{Style.RESET_ALL}"
+        f" {Fore.LIGHTWHITE_EX}|  webhook: {webhook_color}{webhook_state}{Style.RESET_ALL}"
     )
 
     print(f"{Fore.LIGHTBLACK_EX}{'-' * 58}{Style.RESET_ALL}")
     for i, (label, _, _) in enumerate(TOOLS):
         color = ITEM_COLORS[i % len(ITEM_COLORS)]
-        print(f"  {color}[{i + 1}]{Style.RESET_ALL}  {label}")
-    print(f"  {Fore.MAGENTA}[7]{Style.RESET_ALL}  Check a username across all platforms")
-    print(f"  {Fore.MAGENTA}[8]{Style.RESET_ALL}  Check a file across all platforms")
+        print(f"  {color}[{i + 1}]{Style.RESET_ALL}  {Style.BRIGHT}{label}{Style.RESET_ALL}")
+    print(f"  {Fore.LIGHTYELLOW_EX}[7]{Style.RESET_ALL}  Check a username across all platforms")
+    print(f"  {Fore.LIGHTGREEN_EX}[8]{Style.RESET_ALL}  Check a file across all platforms")
     print(f"  {Fore.LIGHTBLACK_EX}[0]{Style.RESET_ALL}  Quit")
     print(f"{Fore.LIGHTBLACK_EX}{'-' * 58}{Style.RESET_ALL}")
 
@@ -174,7 +209,7 @@ def main():
             continue
         print(f"{Fore.RED}  Invalid option - choose 0-8.{Style.RESET_ALL}")
 
-    print(f"{Fore.MAGENTA}  Goodbye!{Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{rainbow('  Goodbye!')}{Style.RESET_ALL}")
 
 
 if __name__ == "__main__":

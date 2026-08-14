@@ -1,9 +1,10 @@
 # Instagram Username Availability Checker
 
 A self-contained, multi-threaded utility for checking Instagram handle
-availability. It queries Instagram's public web signup endpoint
-(`web_create_ajax/attempt`) and reports whether each handle is available, taken,
-or invalid.
+availability. It queries Instagram's public profile lookup endpoint
+(`i.instagram.com/api/v1/users/web_profile_info/`), which returns the profile
+when a handle exists and a 404 otherwise, and reports whether each handle is
+available, taken, or invalid.
 
 > **Use responsibly.** This uses an unofficial endpoint that can change or rate
 > limit without notice. Respect Instagram's Terms of Service. Availability is a
@@ -36,6 +37,7 @@ You can skip the menu:
 ```bash
 python instagram/instagram_checker.py --check myhandle
 python instagram/instagram_checker.py 100 LLLDD
+python instagram/instagram_checker.py --no-proxy 100 LLLDD  # bulk run, skip proxies
 ```
 
 This generates 100 random handles matching `LLLDD` and checks them.
@@ -54,7 +56,12 @@ script to disable either.
 
 ## Notes
 
-- Instagram is aggressive about blocking unauthenticated traffic; results may
-  come back rate-limited (HTTP 429) from datacenter/VPN IPs.
+- This uses the unauthenticated `web_profile_info` lookup instead of the signup
+  `web_create_ajax/attempt` endpoint, which now rate-limits (HTTP 429) most
+  unauthenticated clients. Results can still come back rate-limited from
+  datacenter/VPN IPs.
 - Handles are 1-30 chars using `a-z`, `0-9`, `.` and `_`; they cannot start or
-  end with a period or contain consecutive periods.
+  end with a period or contain consecutive periods. Clearly invalid handles are
+  reported as `invalid` without hitting the API.
+- If a check fails through a proxy, the checker retries that name directly, so
+  dead or expired proxies won't turn every result into `unknown`.

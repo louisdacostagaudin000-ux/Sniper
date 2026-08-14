@@ -10,6 +10,7 @@ Usage:
     python tiktok_checker.py            # interactive menu
     python tiktok_checker.py 100 LLLDD  # 100 random names, pattern LLLDD
     python tiktok_checker.py --check name # check one handle
+    python tiktok_checker.py --no-proxy 100 LLLDD  # bulk run, skip proxies
 """
 
 import itertools
@@ -31,7 +32,7 @@ REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from common import ProxyPool, WebhookNotifier, proxies_dict, load_proxies
+from common import ProxyPool, WebhookNotifier, is_proxy_failure, proxies_dict, load_proxies
 
 USE_PROXIES = True
 ENABLE_WEBHOOK = True
@@ -173,15 +174,28 @@ def clear_output_files():
         open(os.path.join(SCRIPT_DIR, name), "a").close()
 
 
-def check_username(username, proxy=None):
-    """Return 0 = available, 1 = taken, 2 = invalid, None = unknown/error."""
+def _check_once(username, proxy=None):
+    """Single request. Returns ``(code, proxy_failed)``.
+
+    ``code`` is 0 = available, 1 = taken, 2 = invalid, None = unknown/error.
+    ``proxy_failed`` is True only when the *proxy* itself failed.
+    """
     url = PROFILE_URL.format(username=username)
     try:
         r = requests.get(url, headers=HEADERS, timeout=8, proxies=proxies_dict(proxy))
     except Exception as exc:
+        if proxy and is_proxy_failure(exc=exc):
+            PROXY_POOL.report_failure(proxy)
+            return None, True
         with print_lock:
             print(f"  error checking {username}: {exc}")
-        return None
+        return None, False
+
+    if proxy and r.status_code == 407:
+        PROXY_POOL.report_dead(proxy)
+        return None, True
+    if proxy:
+        PROXY_POOL.report_success(proxy)
 
     status = r.status_code
     if status == 200:
@@ -189,14 +203,47 @@ def check_username(username, proxy=None):
         # TikTok embeds `"statusCode":10221` when the account does not exist,
         # and a `"userInfo"` block when it does.
         if '"statuscode":10221' in low or "user page not found" in low:
-            return 0
+            return 0, False
         if '"userinfo"' in low:
-            return 1
+            return 1, False
         # Ambiguous page (e.g. bot challenge) - leave as unknown.
-        return None
+        return None, False
     if status == 404:
-        return 0
-    return None
+        return 0, False
+    return None, False
+
+
+_warned_proxy_fallback = False
+_warned_proxy_lock = threading.Lock()
+
+
+def _warn_proxy_fallback_once():
+    """Print a single notice when a dead proxy forces a direct fallback."""
+    global _warned_proxy_fallback
+    with _warned_proxy_lock:
+        if _warned_proxy_fallback:
+            return
+        _warned_proxy_fallback = True
+    with print_lock:
+        print(
+            Fore.YELLOW
+            + "  [proxy] dead/expired proxies detected - continuing direct"
+            + Style.RESET_ALL
+        )
+
+
+def check_username(username, proxy=None):
+    """Return 0 = available, 1 = taken, 2 = invalid, None = unknown/error.
+
+    When a proxy is used and the proxy itself fails, retry once directly.
+    Platform throttles (401/429) are not retried, so an already rate-limited
+    endpoint isn't double-hit.
+    """
+    code, proxy_failed = _check_once(username, proxy)
+    if proxy is not None and proxy_failed:
+        _warn_proxy_fallback_once()
+        code, _ = _check_once(username, None)
+    return code
 
 
 def worker(q):
@@ -205,11 +252,27 @@ def worker(q):
         if name is None:
             break
         proxy = PROXY_POOL.next() if USE_PROXIES else None
-        save_and_print(name, check_username(name, proxy))
+        code = check_username(name, proxy)
+        save_and_print(name, code)
         q.task_done()
 
 
+def _prune_proxies_once():
+    """Probe and disable dead proxies before a bulk run (runs at most once)."""
+    killed = PROXY_POOL.prune_dead()
+    if killed:
+        with print_lock:
+            print(
+                Fore.YELLOW
+                + f"  [proxy] pruned {killed} dead proxies at startup "
+                + f"({PROXY_POOL.live_count()} live)"
+                + Style.RESET_ALL
+            )
+
+
 def run_with_threads(usernames, num_threads):
+    if USE_PROXIES:
+        _prune_proxies_once()
     q = Queue(maxsize=num_threads * 4)
     threads = []
     for _ in range(num_threads):
@@ -294,10 +357,16 @@ def show_menu():
 
 
 def run():
+    global USE_PROXIES
+    if "--no-proxy" in sys.argv:
+        USE_PROXIES = False
+        sys.argv = [a for a in sys.argv if a != "--no-proxy"]
+
     if len(sys.argv) == 3 and sys.argv[1] == "--check":
         username = sys.argv[2].strip().lstrip("@")
         proxy = PROXY_POOL.next() if USE_PROXIES else None
-        save_and_print(username, check_username(username, proxy))
+        code = check_username(username, proxy)
+        save_and_print(username, code)
         return
 
     if len(sys.argv) == 3:

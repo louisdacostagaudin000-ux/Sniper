@@ -1,9 +1,10 @@
 # Steam Custom URL (Vanity) Availability Checker
 
 A self-contained, multi-threaded utility for checking Steam **custom URL**
-availability. It fetches `https://steamcommunity.com/id/<name>`: a `200` (or a
-redirect to a profile) means the vanity URL is taken and a `404` means it is
-available.
+availability. It fetches `https://steamcommunity.com/id/<name>`: a `200` that
+renders a profile (or a redirect to a profile) means the vanity URL is taken, a
+`404` means it is available, and a `200` with "The specified profile could not
+be found" means it is available too.
 
 > **Important:** Steam does **not** publicly expose a check for the account
 > *login name*. This tool checks the *custom URL* (also called the vanity URL /
@@ -39,6 +40,7 @@ You can skip the menu:
 ```bash
 python steam/steam_checker.py --check myvanity
 python steam/steam_checker.py 100 LLLDD
+python steam/steam_checker.py --no-proxy 100 LLLDD  # bulk run, skip proxies
 ```
 
 ## Pattern key
@@ -57,3 +59,8 @@ to disable either.
 
 - Custom URLs are case-insensitive, 3-32 characters, using letters, numbers and
   underscores.
+- Steam answers `200` even for missing profiles (the "profile could not be
+  found" page), so the checker inspects the page body rather than trusting the
+  status code alone.
+- If a check fails through a proxy, the checker retries that name directly, so
+  dead or expired proxies won't turn every result into `unknown`.

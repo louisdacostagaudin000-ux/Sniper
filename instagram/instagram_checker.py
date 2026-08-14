@@ -10,14 +10,17 @@ Usage:
     python instagram_checker.py            # interactive menu
     python instagram_checker.py 100 LLLDD  # 100 random names, pattern LLLDD
     python instagram_checker.py --check name # check one handle
+    python instagram_checker.py --no-proxy 100 LLLDD  # bulk run, skip proxies
 """
 
 import itertools
 import os
 import random
+import re
 import string
 import sys
 import threading
+import time
 from queue import Queue
 
 import requests
@@ -31,7 +34,7 @@ REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from common import ProxyPool, WebhookNotifier, proxies_dict, load_proxies
+from common import ProxyPool, WebhookNotifier, is_proxy_failure, proxies_dict, load_proxies
 
 USE_PROXIES = True
 ENABLE_WEBHOOK = True
@@ -42,11 +45,13 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
-HOME_URL = "https://www.instagram.com/"
-ATTEMPT_URL = "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
+# Public (unauthenticated) profile lookup. Returns HTTP 200 + JSON with a
+# ``data.user`` object when the handle exists, and 404 when it does not. This
+# is far more reliable than the signup ``web_create_ajax/attempt`` endpoint,
+# which now rate-limits (429) unauthenticated clients aggressively.
+PROFILE_URL = "https://i.instagram.com/api/v1/users/web_profile_info/"
 X_IG_APP_ID = "936619743392459"
-X_ASBD_ID = "129477"
-X_INSTAGRAM_AJAX = "1009916337"
+IG_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 
 BANNER = r"""
  _____                                 _
@@ -175,102 +180,112 @@ def clear_output_files():
         open(os.path.join(SCRIPT_DIR, name), "a").close()
 
 
-# Instagram reuses a CSRF token + cookies across checks so we don't hit the
-# homepage for every username. The cache is invalidated on a 400/403.
-_csrf_lock = threading.Lock()
-_csrf_cache = None
+def is_valid_username(username):
+    """Instagram handle rules: 1-30 chars, letters/digits/period/underscore,
+    no leading/trailing period and no consecutive periods."""
+    if not IG_USERNAME_RE.match(username):
+        return False
+    if username.startswith(".") or username.endswith("."):
+        return False
+    if ".." in username:
+        return False
+    return True
 
 
-def _get_csrf(session):
-    global _csrf_cache
-    with _csrf_lock:
-        cached = _csrf_cache
-    if cached is not None:
-        token, cookies = cached
-        for name, value in cookies.items():
-            session.cookies.set(name, value)
-        return token
+def _check_once(username, proxy=None):
+    """Single request. Returns ``(code, proxy_failed)``.
 
-    try:
-        session.get(
-            HOME_URL,
-            headers={
-                "user-agent": UA,
-                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "accept-language": "en-US,en;q=0.9",
-            },
-            timeout=8,
-        )
-    except requests.exceptions.RequestException:
-        return None
-
-    token = session.cookies.get("csrftoken") or session.cookies.get("csrf")
-    if token:
-        with _csrf_lock:
-            _csrf_cache = (token, dict(session.cookies))
-    return token
-
-
-def check_username(username, proxy=None):
+    ``code`` is 0 = available, 1 = taken, 2 = invalid, None = unknown/error.
+    ``proxy_failed`` is True only when the *proxy* itself failed (407 or a
+    connection error) rather than the platform throttling us.
+    """
     session = requests.Session()
     if proxy:
         session.proxies = proxies_dict(proxy)
     try:
-        csrf = _get_csrf(session)
-        if not csrf:
-            return None
-
-        email = f"{username}.{random.randint(1000, 999999)}@gmail.com"
-        headers = {
-            "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
-            "content-type": "application/x-www-form-urlencoded",
-            "origin": "https://www.instagram.com",
-            "referer": "https://www.instagram.com/accounts/emailsignup/",
-            "user-agent": UA,
-            "x-requested-with": "XMLHttpRequest",
-            "x-instagram-ajax": X_INSTAGRAM_AJAX,
-            "x-ig-app-id": X_IG_APP_ID,
-            "x-asbd-id": X_ASBD_ID,
-            "x-csrftoken": csrf,
-        }
-        data = {
-            "email": email,
-            "username": username,
-            "first_name": "",
-            "opt_into_one_tap": False,
-        }
-        r = session.post(ATTEMPT_URL, data=data, headers=headers, timeout=8)
-
-        if r.status_code in (400, 403):
-            global _csrf_cache
-            with _csrf_lock:
-                _csrf_cache = None
-
-        if r.status_code == 200:
-            try:
-                body = r.json()
-            except ValueError:
-                return None
-            username_errors = (body.get("errors") or {}).get("username") or []
-            if username_errors:
-                first = username_errors[0]
-                message = first.get("message", "") if isinstance(first, dict) else str(first)
-                code = first.get("code", "") if isinstance(first, dict) else ""
-                if (
-                    "taken" in str(code).lower()
-                    or "isn't available" in message
-                    or "not available" in message.lower()
-                ):
-                    return 1
-                return 2
-            return 0
+        for attempt in range(2):
+            r = session.get(
+                PROFILE_URL,
+                params={"username": username},
+                headers={
+                    "accept": "*/*",
+                    "accept-language": "en-US,en;q=0.9",
+                    "user-agent": UA,
+                    "x-ig-app-id": X_IG_APP_ID,
+                    "x-requested-with": "XMLHttpRequest",
+                },
+                timeout=8,
+            )
+            if r.status_code in (200, 404):
+                break
+            # Only the transient 400 (server-side "asset ... has been deleted"
+            # error) is worth an immediate retry. Throttles (401/429) and 5xx
+            # are left unknown so we don't hammer an already-annoyed endpoint.
+            if r.status_code != 400 or attempt == 1:
+                break
+            time.sleep(1.0)
     except Exception as exc:
+        if proxy and is_proxy_failure(exc=exc):
+            PROXY_POOL.report_failure(proxy)
+            return None, True
         with print_lock:
             print(f"  error checking {username}: {exc}")
+        return None, False
     finally:
         session.close()
-    return None
+
+    if proxy and r.status_code == 407:
+        PROXY_POOL.report_dead(proxy)
+        return None, True
+    if proxy:
+        PROXY_POOL.report_success(proxy)
+
+    if r.status_code == 200:
+        try:
+            body = r.json()
+        except ValueError:
+            return None, False
+        if isinstance(body, dict) and body.get("data", {}).get("user"):
+            return 1, False
+        return None, False
+    if r.status_code == 404:
+        return 0, False
+    return None, False
+
+
+_warned_proxy_fallback = False
+_warned_proxy_lock = threading.Lock()
+
+
+def _warn_proxy_fallback_once():
+    """Print a single notice when a dead proxy forces a direct fallback."""
+    global _warned_proxy_fallback
+    with _warned_proxy_lock:
+        if _warned_proxy_fallback:
+            return
+        _warned_proxy_fallback = True
+    with print_lock:
+        print(
+            Fore.YELLOW
+            + "  [proxy] dead/expired proxies detected - continuing direct"
+            + Style.RESET_ALL
+        )
+
+
+def check_username(username, proxy=None):
+    """Return 0 = available, 1 = taken, 2 = invalid, None = unknown/error.
+
+    When a proxy is used and the proxy itself fails, retry once directly.
+    Platform throttles (401/429) are not retried, so an already rate-limited
+    endpoint isn't double-hit.
+    """
+    if not is_valid_username(username):
+        return 2
+    code, proxy_failed = _check_once(username, proxy)
+    if proxy is not None and proxy_failed:
+        _warn_proxy_fallback_once()
+        code, _ = _check_once(username, None)
+    return code
 
 
 def worker(q):
@@ -279,11 +294,27 @@ def worker(q):
         if name is None:
             break
         proxy = PROXY_POOL.next() if USE_PROXIES else None
-        save_and_print(name, check_username(name, proxy))
+        code = check_username(name, proxy)
+        save_and_print(name, code)
         q.task_done()
 
 
+def _prune_proxies_once():
+    """Probe and disable dead proxies before a bulk run (runs at most once)."""
+    killed = PROXY_POOL.prune_dead()
+    if killed:
+        with print_lock:
+            print(
+                Fore.YELLOW
+                + f"  [proxy] pruned {killed} dead proxies at startup "
+                + f"({PROXY_POOL.live_count()} live)"
+                + Style.RESET_ALL
+            )
+
+
 def run_with_threads(usernames, num_threads):
+    if USE_PROXIES:
+        _prune_proxies_once()
     q = Queue(maxsize=num_threads * 4)
     threads = []
     for _ in range(num_threads):
@@ -368,10 +399,16 @@ def show_menu():
 
 
 def run():
+    global USE_PROXIES
+    if "--no-proxy" in sys.argv:
+        USE_PROXIES = False
+        sys.argv = [a for a in sys.argv if a != "--no-proxy"]
+
     if len(sys.argv) == 3 and sys.argv[1] == "--check":
         username = sys.argv[2].strip().lstrip("@")
         proxy = PROXY_POOL.next() if USE_PROXIES else None
-        save_and_print(username, check_username(username, proxy))
+        code = check_username(username, proxy)
+        save_and_print(username, code)
         return
 
     if len(sys.argv) == 3:

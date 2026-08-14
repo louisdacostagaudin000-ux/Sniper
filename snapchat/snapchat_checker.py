@@ -10,11 +10,13 @@ Usage:
     python snapchat_checker.py            # interactive menu
     python snapchat_checker.py 100 LLLDD  # 100 random names, pattern LLLDD
     python snapchat_checker.py --check name # check one handle
+    python snapchat_checker.py --no-proxy 100 LLLDD  # bulk run, skip proxies
 """
 
 import itertools
 import os
 import random
+import re
 import string
 import sys
 import threading
@@ -31,7 +33,7 @@ REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from common import ProxyPool, WebhookNotifier, proxies_dict, load_proxies
+from common import ProxyPool, WebhookNotifier, is_proxy_failure, proxies_dict, load_proxies
 
 USE_PROXIES = True
 ENABLE_WEBHOOK = True
@@ -42,18 +44,17 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
-ENDPOINT = "https://accounts.snapchat.com/accounts/get_username_suggestions"
-SIGNUP_URL = "https://accounts.snapchat.com/accounts/signup"
-DEFAULT_XSRF = "JxVkpuY3VbHfOFagfT0csQ"
+# Public profile-preview page. A public profile renders HTTP 200 (taken); a
+# missing handle returns 404 with ``"pageType":"NOT_FOUND"`` in the embedded
+# JSON. The old ``get_username_suggestions`` endpoint now answers ``OK`` for
+# every request (even invalid names), so it can no longer be used.
+ADD_URL = "https://www.snapchat.com/add/{username}"
+SNAP_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{2,14}$")
 
 HEADERS = {
     "user-agent": UA,
-    "content-type": "application/x-www-form-urlencoded; charset=utf-8",
-    "accept": "*/*",
-    "origin": "https://accounts.snapchat.com",
-    "referer": "https://accounts.snapchat.com/",
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "accept-language": "en-US,en;q=0.9",
-    "connection": "close",
 }
 
 BANNER = r"""
@@ -181,84 +182,91 @@ def clear_output_files():
         open(os.path.join(SCRIPT_DIR, name), "a").close()
 
 
-# Snapchat needs an xsrf_token; we cache it and refresh on 400/401/403.
-_xsrf_lock = threading.Lock()
-_xsrf = DEFAULT_XSRF
+def is_valid_username(username):
+    """Snapchat rules: 3-15 chars, must start with a letter, and may contain
+    letters, digits, and the characters ``-``, ``_`` or ``.``."""
+    return bool(SNAP_USERNAME_RE.match(username))
 
 
-def _refresh_xsrf(session):
-    global _xsrf
-    try:
-        session.get(
-            SIGNUP_URL,
-            headers={"user-agent": UA, "accept": "text/html,*/*"},
-            timeout=8,
-        )
-    except requests.exceptions.RequestException:
-        pass
-    token = session.cookies.get("xsrf_token") or session.cookies.get("XSRF-TOKEN")
-    if token:
-        with _xsrf_lock:
-            _xsrf = token
-    return _xsrf
+def _check_once(username, proxy=None):
+    """Single request. Returns ``(code, proxy_failed)``.
 
-
-def check_username(username, proxy=None):
-    """Return 0 = available, 1 = taken, 2 = invalid, None = unknown/error."""
+    ``code`` is 0 = available, 1 = taken, 2 = invalid, None = unknown/error.
+    ``proxy_failed`` is True only when the *proxy* itself failed.
+    """
     session = requests.Session()
     if proxy:
         session.proxies = proxies_dict(proxy)
     try:
-        with _xsrf_lock:
-            xsrf = _xsrf
-        data = {"requested_username": username, "xsrf_token": xsrf}
-        r = session.post(
-            ENDPOINT,
+        r = session.get(
+            ADD_URL.format(username=username),
             headers=HEADERS,
-            cookies={"xsrf_token": xsrf},
-            data=data,
             timeout=8,
+            allow_redirects=True,
         )
-
-        if r.status_code in (400, 401, 403):
-            # Refresh the token once and retry.
-            xsrf = _refresh_xsrf(session)
-            data = {"requested_username": username, "xsrf_token": xsrf}
-            r = session.post(
-                ENDPOINT,
-                headers=HEADERS,
-                cookies={"xsrf_token": xsrf},
-                data=data,
-                timeout=8,
-            )
     except Exception as exc:
+        if proxy and is_proxy_failure(exc=exc):
+            PROXY_POOL.report_failure(proxy)
+            return None, True
         with print_lock:
             print(f"  error checking {username}: {exc}")
-        return None
+        return None, False
     finally:
         session.close()
 
-    try:
-        payload = r.json()
-    except ValueError:
-        payload = None
+    if proxy and r.status_code == 407:
+        PROXY_POOL.report_dead(proxy)
+        return None, True
+    if proxy:
+        PROXY_POOL.report_success(proxy)
 
-    marker = None
-    if isinstance(payload, dict):
-        for key in ("status", "result", "username_status", "requested_username_status"):
-            if isinstance(payload.get(key), str):
-                marker = payload[key].upper()
-                break
-    if marker is None:
-        marker = r.text.upper()
+    if r.status_code == 200:
+        return 1, False
+    if r.status_code == 404:
+        if '"pageType":"NOT_FOUND"' in r.text:
+            return 0, False
+        # A generic 404 page means the name is not a routable handle.
+        return 2, False
+    return None, False
 
-    if "TAKEN" in marker or "DELETED" in marker:
-        return 1
-    if "OK" in marker:
-        return 0
-    if any(s in marker for s in ("TOO_LONG", "TOO_SHORT", "INVALID_BEGIN", "INVALID_CHAR")):
+
+_warned_proxy_fallback = False
+_warned_proxy_lock = threading.Lock()
+
+
+def _warn_proxy_fallback_once():
+    """Print a single notice when a dead proxy forces a direct fallback."""
+    global _warned_proxy_fallback
+    with _warned_proxy_lock:
+        if _warned_proxy_fallback:
+            return
+        _warned_proxy_fallback = True
+    with print_lock:
+        print(
+            Fore.YELLOW
+            + "  [proxy] dead/expired proxies detected - continuing direct"
+            + Style.RESET_ALL
+        )
+
+
+def check_username(username, proxy=None):
+    """Return 0 = available, 1 = taken, 2 = invalid, None = unknown/error.
+
+    Uses the public profile-preview page. Snapchat only serves a profile page
+    (HTTP 200) for accounts that have opted in to a public profile, so a
+    private account reports as ``available`` (404) just like a truly free name
+    - there is no unauthenticated endpoint that distinguishes the two.
+
+    When a proxy is used and the proxy itself fails, retry once directly.
+    Platform throttles (401/429) are not retried.
+    """
+    if not is_valid_username(username):
         return 2
-    return None
+    code, proxy_failed = _check_once(username, proxy)
+    if proxy is not None and proxy_failed:
+        _warn_proxy_fallback_once()
+        code, _ = _check_once(username, None)
+    return code
 
 
 def worker(q):
@@ -267,11 +275,27 @@ def worker(q):
         if name is None:
             break
         proxy = PROXY_POOL.next() if USE_PROXIES else None
-        save_and_print(name, check_username(name, proxy))
+        code = check_username(name, proxy)
+        save_and_print(name, code)
         q.task_done()
 
 
+def _prune_proxies_once():
+    """Probe and disable dead proxies before a bulk run (runs at most once)."""
+    killed = PROXY_POOL.prune_dead()
+    if killed:
+        with print_lock:
+            print(
+                Fore.YELLOW
+                + f"  [proxy] pruned {killed} dead proxies at startup "
+                + f"({PROXY_POOL.live_count()} live)"
+                + Style.RESET_ALL
+            )
+
+
 def run_with_threads(usernames, num_threads):
+    if USE_PROXIES:
+        _prune_proxies_once()
     q = Queue(maxsize=num_threads * 4)
     threads = []
     for _ in range(num_threads):
@@ -356,10 +380,16 @@ def show_menu():
 
 
 def run():
+    global USE_PROXIES
+    if "--no-proxy" in sys.argv:
+        USE_PROXIES = False
+        sys.argv = [a for a in sys.argv if a != "--no-proxy"]
+
     if len(sys.argv) == 3 and sys.argv[1] == "--check":
         username = sys.argv[2].strip().lstrip("@")
         proxy = PROXY_POOL.next() if USE_PROXIES else None
-        save_and_print(username, check_username(username, proxy))
+        code = check_username(username, proxy)
+        save_and_print(username, code)
         return
 
     if len(sys.argv) == 3:

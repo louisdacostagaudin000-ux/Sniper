@@ -66,6 +66,7 @@ The four simple checkers also accept `--check NAME` (single check) and
 ```bash
 python tiktok/tiktok_checker.py --check someuser
 python tiktok/tiktok_checker.py 100 LLLDD
+python tiktok/tiktok_checker.py --no-proxy 100 LLLDD  # bulk run, skip proxies
 ```
 
 ## Shared proxies + webhook
@@ -74,6 +75,9 @@ Every checker reads the same two files at the repo root:
 
 - **`proxy.txt`** — HTTP proxies, `user:pass@host:port`, one per line. Used for
   round-robin rotation across the worker threads.
+- A proxy that fails a few times in a row (e.g. a `407` from an expired key) is
+  put on a short cooldown and skipped, and the checker falls back to a direct
+  connection, so dead proxies don't stall a run.
 - **`webhook.txt`** — a Discord webhook URL (one line). When a name is found
   available, each checker posts a message in the form
   `instagram "izqkds" (available)`.

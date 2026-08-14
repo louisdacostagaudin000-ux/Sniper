@@ -37,6 +37,7 @@ You can skip the menu:
 ```bash
 python tiktok/tiktok_checker.py --check someuser
 python tiktok/tiktok_checker.py 100 LLLDD
+python tiktok/tiktok_checker.py --no-proxy 100 LLLDD  # bulk run, skip proxies
 ```
 
 ## Pattern key
@@ -57,3 +58,5 @@ to disable either.
   periods.
 - Because this checks the profile page rather than a dedicated API, a name that
   returns `available` could still be blocked from registration for other reasons.
+- If a check fails through a proxy, the checker retries that name directly, so
+  dead or expired proxies won't turn every result into `unknown`.
